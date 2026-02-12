@@ -8,6 +8,7 @@ import os
 import sys
 import time
 import json
+import stat
 import hashlib
 import argparse
 from pathlib import Path
@@ -76,6 +77,8 @@ class Config:
             ],
             "auto_create_dirs": True,
             "passive_mode": True,  # for FTP
+            "auto_upload": True,  # auto-upload on file changes
+            "auto_delete": True,  # auto-delete remote file when local is deleted
             "sync_on_start": False  # sync all files on startup
         }
         
@@ -163,6 +166,32 @@ class SFTPUploader:
                 except Exception as e:
                     logging.warning(f"Could not create directory {d}: {e}")
     
+    def download(self, remote_path: str, local_path: str) -> bool:
+        """Download file from remote server"""
+        try:
+            local_dir = os.path.dirname(local_path)
+            if local_dir:
+                os.makedirs(local_dir, exist_ok=True)
+            self.sftp.get(remote_path, local_path)
+            return True
+        except Exception as e:
+            logging.error(f"Download failed for {remote_path}: {e}")
+            return False
+
+    def walk_remote(self, remote_path: str):
+        """Recursively yield all file paths under remote_path"""
+        try:
+            for entry in self.sftp.listdir_attr(remote_path):
+                if entry.filename in ('.', '..'):
+                    continue
+                full_path = remote_path.rstrip('/') + '/' + entry.filename
+                if stat.S_ISDIR(entry.st_mode):
+                    yield from self.walk_remote(full_path)
+                else:
+                    yield full_path
+        except Exception as e:
+            logging.error(f"Failed to list remote directory {remote_path}: {e}")
+
     def close(self):
         """Close connection"""
         if self.sftp:
@@ -252,6 +281,33 @@ class FTPUploader:
                 except Exception as e:
                     logging.warning(f"Could not create directory {d}: {e}")
     
+    def download(self, remote_path: str, local_path: str) -> bool:
+        """Download file from remote server"""
+        try:
+            local_dir = os.path.dirname(local_path)
+            if local_dir:
+                os.makedirs(local_dir, exist_ok=True)
+            with open(local_path, 'wb') as f:
+                self.ftp.retrbinary(f'RETR {remote_path}', f.write)
+            return True
+        except Exception as e:
+            logging.error(f"Download failed for {remote_path}: {e}")
+            return False
+
+    def walk_remote(self, remote_path: str):
+        """Recursively yield all file paths under remote_path"""
+        try:
+            for name, facts in self.ftp.mlsd(remote_path):
+                if name in ('.', '..'):
+                    continue
+                full_path = remote_path.rstrip('/') + '/' + name
+                if facts.get('type') == 'dir':
+                    yield from self.walk_remote(full_path)
+                else:
+                    yield full_path
+        except Exception as e:
+            logging.error(f"Failed to list remote directory {remote_path}: {e}")
+
     def close(self):
         """Close connection"""
         if self.ftp:
@@ -273,6 +329,7 @@ class FileSyncHandler(FileSystemEventHandler):
         self.ignore_patterns = config.get('ignore_patterns', [])
         self.pending_uploads: Dict[str, float] = {}
         self.upload_delay = 0.5  # seconds to wait before uploading
+        self._downloaded_paths: Dict[str, float] = {}  # loop prevention
     
     def should_ignore(self, path: str) -> bool:
         """Check if path should be ignored"""
@@ -287,7 +344,23 @@ class FileSyncHandler(FileSystemEventHandler):
                 return True
         
         return False
-    
+
+    def mark_as_downloaded(self, local_path: str):
+        """Mark a file as recently downloaded to prevent re-upload"""
+        resolved = str(Path(local_path).resolve())
+        self._downloaded_paths[resolved] = time.time()
+
+    def _is_recently_downloaded(self, local_path: str) -> bool:
+        """Check if a file was recently downloaded (within 10s grace period)"""
+        resolved = str(Path(local_path).resolve())
+        download_time = self._downloaded_paths.get(resolved)
+        if download_time is not None:
+            if time.time() - download_time < 10.0:
+                return True
+            else:
+                del self._downloaded_paths[resolved]
+        return False
+
     def get_remote_path(self, local_path: str) -> str:
         """Convert local path to remote path"""
         rel_path = Path(local_path).relative_to(self.local_path)
@@ -308,19 +381,25 @@ class FileSyncHandler(FileSystemEventHandler):
     def on_deleted(self, event):
         if event.is_directory:
             return
-        
+        if not self.config.get('auto_delete', True):
+            return
         if self.should_ignore(event.src_path):
             return
-        
+
         remote_path = self.get_remote_path(event.src_path)
         logging.info(f"Deleting: {event.src_path} -> {remote_path}")
         self.uploader.delete(remote_path)
     
     def schedule_upload(self, local_path: str):
         """Schedule file for upload after delay"""
+        if not self.config.get('auto_upload', True):
+            return
         if self.should_ignore(local_path):
             return
-        
+        if self._is_recently_downloaded(local_path):
+            logging.debug(f"Skipping re-upload of downloaded file: {os.path.basename(local_path)}")
+            return
+
         self.pending_uploads[local_path] = time.time()
     
     def process_pending_uploads(self):
@@ -391,7 +470,35 @@ class FileSyncTool:
                     self.uploader.upload(file_path, remote_path)
         
         logging.info("Initial sync complete")
-    
+
+    def download_all_files(self):
+        """Download all files from remote server to local directory"""
+        logging.info("Downloading all files from remote...")
+        remote_base = self.config['remote_path']
+        local_base = Path(self.config['local_path'])
+
+        count = 0
+        for remote_file in self.uploader.walk_remote(remote_base):
+            # Convert remote path to local path
+            rel_path = remote_file[len(remote_base):].lstrip('/')
+            local_file = str(local_base / rel_path)
+
+            # Check ignore patterns
+            if self.handler.should_ignore(local_file):
+                continue
+
+            logging.info(f"Downloading: {remote_file} -> {local_file}")
+            success = self.uploader.download(remote_file, local_file)
+            if success:
+                # Mark after download to prevent re-upload by watcher
+                self.handler.mark_as_downloaded(local_file)
+                logging.info(f"  Downloaded: {rel_path}")
+                count += 1
+            else:
+                logging.error(f"  Failed: {rel_path}")
+
+        logging.info(f"Download complete ({count} files)")
+
     def start(self):
         """Start watching for file changes"""
         try:
@@ -406,6 +513,7 @@ class FileSyncTool:
             
             logging.info(f"Watching: {watch_path}")
             logging.info(f"Remote: {self.config['protocol']}://{self.config['host']}{self.config['remote_path']}")
+            logging.info(f"Auto-upload: {'enabled' if self.config.get('auto_upload', True) else 'disabled'}")
             logging.info("Press Ctrl+C to stop")
             
             try:
@@ -435,6 +543,7 @@ Examples:
   %(prog)s -c myconfig.json         # Use custom config file
   %(prog)s --create-config          # Create example config file
   %(prog)s --test-connection        # Test connection and exit
+  %(prog)s --download               # Download all remote files to local
         """
     )
     
@@ -454,6 +563,12 @@ Examples:
         '--test-connection',
         action='store_true',
         help='Test connection to remote server and exit'
+    )
+
+    parser.add_argument(
+        '--download',
+        action='store_true',
+        help='Download all files from remote server to local directory and exit'
     )
 
     args = parser.parse_args()
@@ -480,6 +595,16 @@ Examples:
             print(f"Connection successful!")
         except Exception as e:
             print(f"Connection failed: {e}")
+            sys.exit(1)
+        return
+
+    if args.download:
+        try:
+            sync_tool = FileSyncTool(args.config)
+            sync_tool.download_all_files()
+            sync_tool.uploader.close()
+        except Exception as e:
+            print(f"Download failed: {e}")
             sys.exit(1)
         return
 
