@@ -434,6 +434,7 @@ Examples:
   %(prog)s                          # Use config.json in current directory
   %(prog)s -c myconfig.json         # Use custom config file
   %(prog)s --create-config          # Create example config file
+  %(prog)s --test-connection        # Test connection and exit
         """
     )
     
@@ -448,13 +449,40 @@ Examples:
         action='store_true',
         help='Create example configuration file and exit'
     )
-    
+
+    parser.add_argument(
+        '--test-connection',
+        action='store_true',
+        help='Test connection to remote server and exit'
+    )
+
     args = parser.parse_args()
     
     if args.create_config:
         Config.create_example(args.config)
         return
-    
+
+    if args.test_connection:
+        config = Config.load(args.config)
+        protocol = config.get('protocol', 'sftp').lower()
+        host = config.get('host', '?')
+        port = config.get('port', 22 if protocol == 'sftp' else 21)
+        print(f"Testing {protocol.upper()} connection to {host}:{port}...")
+        try:
+            if protocol == 'sftp':
+                uploader = SFTPUploader(config)
+            elif protocol in ['ftp', 'ftps']:
+                uploader = FTPUploader(config)
+            else:
+                print(f"Unsupported protocol: {protocol}")
+                sys.exit(1)
+            uploader.close()
+            print(f"Connection successful!")
+        except Exception as e:
+            print(f"Connection failed: {e}")
+            sys.exit(1)
+        return
+
     try:
         sync_tool = FileSyncTool(args.config)
         sync_tool.start()

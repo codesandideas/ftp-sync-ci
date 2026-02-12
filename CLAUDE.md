@@ -21,6 +21,9 @@ python file_sync.py -c myconfig.json
 # Generate example config file
 python file_sync.py --create-config
 
+# Test connection without syncing
+python file_sync.py --test-connection
+
 # Via wrapper scripts (auto-install deps)
 ./sync.sh          # Unix/Linux
 sync.bat           # Windows
